@@ -64,7 +64,7 @@ struct __attribute__((__packed__)) DirectoryEntry
 };
 
 struct DirectoryEntry * current_working_directory;
-struct DirectoryEntry * ls_directory;
+struct DirectoryEntry * ls_directory = NULL;
 
 /*
         FAT32 Variables
@@ -85,6 +85,7 @@ FILE *  write_file;
 FILE *  put_file;
 int     number_of_files = 0;
 int     ls_files = 0;
+int     first_free_block = 0;
 
 int32_t free_blocks_list[129152];
 
@@ -97,7 +98,7 @@ char ** parse_input( char *, char * );
 
 void    free_all( char **, char ** );
 
-void    free_directory( void );
+void    free_directory( struct DirectoryEntry ** );
 
 void    file_system_init( void );
 
@@ -105,7 +106,7 @@ int     LBAToOffset( int32_t );
 
 int     get_command_number( char * );
 
-int compare( char *, char * );
+int compare( char *, char *, char ** );
 
 int16_t NextLB( uint32_t );
 
@@ -113,7 +114,7 @@ int count_back_paths( char * );
 
 char ** get_cd_paths( char *, int * );
 
-int find_file( struct DirectoryEntry * , char * , int * );
+int find_file( struct DirectoryEntry * , char * , int *, int);
 
 void handle_open( char * );
 void handle_close( void );
@@ -121,9 +122,12 @@ void handle_info( void );
 void handle_stat( char * );
 void handle_get( char * );
 void handle_put( char * );
-void handle_cd( char *, int );
-void handle_ls( char * );
+struct DirectoryEntry * handle_cd( struct DirectoryEntry *,char * ,
+                                  int ,int * );
+void handle_ls( struct DirectoryEntry * ,char * );
 void handle_read( char *, char *, char * );
+
+void handle_cd_wrapper( struct DirectoryEntry *, char ** );
 
 void test_function( char * token[] )
 {
@@ -158,29 +162,38 @@ int main()
       int command_number = get_command_number( token[0] );
       if( token[1] != NULL )
       {
+        char * temp = (char *) malloc((strlen(token[1])+1)*sizeof(char));
+        strcpy(temp, token[1]);
+                                      
         switch ( command_number )
         {
           case 0:
-            handle_open(token[1]);
+            handle_open(temp);
             break;
           case 3:
-            handle_stat(token[1]);
+            handle_stat(temp);
             break;
           case 4:
-            handle_get(token[1]);
+            handle_get(temp);
             break;
           case 5:
-            handle_put(token[1]);
+            handle_put(temp);
             break;
           case 6:
-            handle_cd(token[1],false);
+            handle_cd_wrapper(current_working_directory, &temp);
             break;
           case 7:
-            handle_ls(token[1]);
+            handle_ls(current_working_directory,temp);
             break;
-          case 8:
-            handle_read(token[1], token[2], token[3]);
         }
+        free(temp);
+      }
+      if( token[1] != NULL && token[2] != NULL && token[3] != NULL && command_number == 8 )
+      {
+        char * temp = (char *) malloc((strlen(token[1])+1)*sizeof(char));
+        strcpy(temp, token[1]);
+        handle_read(temp, token[2], token[3]);
+        free(temp);
       }
       else
       {
@@ -193,7 +206,7 @@ int main()
             handle_info();
             break;
           case 7:
-            handle_ls("");
+            handle_ls(current_working_directory,"");
             break;
           case 9:
           case 10:
@@ -202,7 +215,7 @@ int main()
         }
       }
     }
-    
+  
     free_all(token, &working_root);
   }
   return 0;
@@ -245,7 +258,7 @@ char ** parse_input( char * working_root ,char * cmd_str )
     token[token_count] = strndup( arg_ptr, MAX_COMMAND_SIZE );
     if( strlen( token[token_count] ) == 0 )
     {
-      token[token_count] = NULL;
+      break;
     }
     token_count++;
   }
@@ -257,17 +270,16 @@ void free_all( char ** tokens, char ** working_root )
   int i;
   for( i = 0; i < MAX_NUM_ARGUMENTS; i++ )
   {
-    if( tokens[i] != NULL )
-      free(tokens[i]);
+    free(tokens[i]);
   }
   free(tokens);
   free(*working_root);
 }
 
 
-void free_directory()
+void free_directory( struct DirectoryEntry ** directory )
 {
-  free(current_working_directory);
+  free(*directory);
 }
 int LBAToOffset( int32_t sector )
 {
@@ -319,6 +331,19 @@ void file_system_init()
     number_of_files +=16;
   }
   while( next_cluster != -1 );
+  
+  // Initialize free blocks list
+  i = 2;
+  int k = 0;
+  while( i < 129152 )
+  {
+    if( NextLB(i) == 0 )
+    {
+      free_blocks_list[k] = i;
+      k++;
+    }
+    i++;
+  }
 }
 
 
@@ -397,22 +422,16 @@ void handle_stat( char * name )
   uint8_t   file_attr;
   uint32_t  file_size;
   uint16_t  file_cluster;
-  int i;
+  int index;
   int found = false;
-  for( i = 0; i < MAX_NUM_FILES; i++ )
+  if( find_file(current_working_directory, name, &index, number_of_files) )
   {
-    char curr_working_string[12];
-    curr_working_string[11] = '\0';
-    memcpy(curr_working_string, current_working_directory[i].DIR_Name, 11);
-    if( compare(curr_working_string, name) )
-    {
-      file_attr = current_working_directory[i].DIR_Attr;
-      file_size = current_working_directory[i].DIR_FileSize;
-      file_cluster = current_working_directory[i].DIR_FirstClusterLow;
-      printf("%-10s %10s %10s\n","Attribute", "Size", "Cluster");
-      printf("%-10d %10d %10d\n", file_attr, file_size, file_cluster);
-      found = true;
-    }
+    file_attr = current_working_directory[index].DIR_Attr;
+    file_size = current_working_directory[index].DIR_FileSize;
+    file_cluster = current_working_directory[index].DIR_FirstClusterLow;
+    printf("%-10s %10s %10s\n","Attribute", "Size", "Cluster");
+    printf("%-10X %10d %10d\n", file_attr, file_size, file_cluster);
+    found = true;
   }
   if( !found )
   {
@@ -421,22 +440,21 @@ void handle_stat( char * name )
 }
 void handle_get( char * name )
 {
+  char * temp = (char*)malloc((strlen(name) +1 )* sizeof(char));
+  temp[strlen(name)] = '\0';
+  strncpy(temp, name, strlen(name));
   if( !file_open )
   {
     printf("Error: File system image must be opened first.\n");
     return;
   }
   int index;
-  if( find_file(current_working_directory, name, &index) )
+  if( find_file(current_working_directory, temp, &index, number_of_files) )
   {
     uint32_t file_size = current_working_directory[index].DIR_FileSize;
     uint32_t original_file_size = file_size;
     int16_t current_cluster = current_working_directory[index].DIR_FirstClusterLow;
-    char * file_name = (char*)malloc(strlen(current_working_directory[index].DIR_Name)+3*sizeof(char));
-    file_name[strlen(current_working_directory[index].DIR_Name)-2] = '\0';
-    strcat(file_name, "./");
-    strcat(file_name, name);
-    write_file = fopen(file_name,"wb");
+    write_file = fopen(name,"wb");
     int offset = LBAToOffset(current_cluster);
     int16_t next_cluster;
     uint32_t i = 0;
@@ -454,7 +472,6 @@ void handle_get( char * name )
     while( next_cluster != -1 );
     if( write_file )
     {
-      printf("Successfully wrote\n");
       fwrite(buffer, original_file_size, 1, write_file);
       fclose(write_file);
     }
@@ -464,7 +481,6 @@ void handle_get( char * name )
     printf("Error: File not found\n");
     return;
   }
-  
 }
 void handle_put( char * path )
 {
@@ -478,6 +494,7 @@ void handle_put( char * path )
   if( put_file )
   {
     // Update buffer based on file contents
+    struct DirectoryEntry * local_dir = current_working_directory;
     char * buffer;
     fseek(put_file, 0, SEEK_END);
     uint32_t file_size = (uint32_t)ftell(put_file);
@@ -486,148 +503,84 @@ void handle_put( char * path )
     fread(buffer, file_size,1,put_file);
     fclose(put_file);
     uint32_t FATAddress = BPB_BytsPerSec * BPB_RsvdSecCnt;
-    int32_t i = 2;
-    int k = 0; // index for free_blocks_list
 
-    // Populate free blocks list
-    while( i < 129152 )
+    int file_index = find_unused_file(local_dir);
+    if( file_index == -1 )
     {
-      if( NextLB(i) == 0 )
+      int k = 0;
+      int local_size = number_of_files;
+      while( k < local_size && file_index == -1 )
       {
-        free_blocks_list[k] = i;
+        if( local_dir[k].DIR_Attr == 0x10 )
+        {
+          local_dir = handle_cd(local_dir, local_dir[k].DIR_Name, local_size, &local_size);
+          file_index = find_unused_file(local_dir);
+        }
         k++;
       }
-      i++;
     }
+    uint8_t temp1[4] = {0};
+    uint8_t temp2[8] = {0};
 
-    i = 2; // reset i to root sector
-    k = 0; // reset free block
-    int file_index = find_unused_file(current_working_directory);
-    
+    char * modified_string = (char*)malloc(12*sizeof(char));
+    struct DirectoryEntry * file_to_replace = (struct DirectoryEntry *) malloc(sizeof(struct DirectoryEntry));
+    // dirty trick just so I can get a modified string >:)
+    compare("dummy", path, &modified_string);
+    strncpy(file_to_replace[0].DIR_Name, modified_string, 11*sizeof(char));
+    file_to_replace[0].DIR_Attr = 0x10;
+    memcpy(file_to_replace[0].Unused1, temp2, 8 * sizeof(uint8_t));
+    memcpy(file_to_replace[0].Unused2, temp1, 4 * sizeof(uint8_t));
+    file_to_replace[0].DIR_FirstClusterHigh = 0;
+    file_to_replace[0].DIR_FileSize = file_size;
+    file_to_replace[0].DIR_FirstClusterLow = free_blocks_list[first_free_block];
+    free_blocks_list[first_free_block++] = 0;
   }
 }
-void handle_cd( char * path, int ls_flag )
+
+struct DirectoryEntry * handle_cd( struct DirectoryEntry * directory ,char * path,
+                                  int current_size,int * new_size )
 {
   if( !file_open )
   {
     printf("Error: File system image must be opened first.\n");
-    return;
+    return NULL;
   }
-  
-  int back_paths = count_back_paths(path);
-  int iters = 0;
-  int local_number = number_of_files;
-  if( back_paths > 1 )
+  int directory_index;
+  if ( find_file(directory, path, &directory_index, current_size) )
   {
-    while( iters < back_paths )
+    struct DirectoryEntry directory_to_navigate = directory[directory_index];
+    struct DirectoryEntry * directory_to_return = (struct DirectoryEntry *)malloc(sizeof(struct DirectoryEntry) * 16);
+    int32_t next_cluster = directory_to_navigate.DIR_FirstClusterLow;
+    int total_number_of_files = 0;
+    int j = 0;
+    do
     {
-      int i;
-      int old_number_of_files = local_number;
-      for( i = 0; i < old_number_of_files; i++ )
+      if( j != 0 )
       {
-        if( compare(current_working_directory[i].DIR_Name, "..") )
-        {
-          int j = 0;
-          int32_t  next_cluster = current_working_directory[i].DIR_FirstClusterLow;
-          free_directory();
-          current_working_directory = (struct DirectoryEntry *)malloc(sizeof(struct DirectoryEntry) * 16);
-          local_number = 0;
-          number_of_files = 0;
-          do
-          {
-            if( j != 0 )
-            {
-              current_working_directory = (struct DirectoryEntry * )realloc( current_working_directory , sizeof(struct DirectoryEntry) * number_of_files *16);
-            }
-            if( next_cluster == 0 )
-            {
-              next_cluster = 2;
-            }
-            int offset = LBAToOffset(next_cluster);
-            fseek(fat32_image,offset, SEEK_SET);
-            fread(&current_working_directory[j], sizeof(struct DirectoryEntry), 16, fat32_image);
-            next_cluster = NextLB(next_cluster);
-            j += 15;
-            local_number +=16;
-            number_of_files += 16;
-          }
-          while( next_cluster != -1 );
-        }
+        directory_to_return = (struct DirectoryEntry *)realloc(directory_to_return, sizeof(struct DirectoryEntry) * total_number_of_files * 16);
       }
-      iters++;
-    }
-  }
-  
-  int number_of_paths;
-  char ** paths = get_cd_paths(path, &number_of_paths);
-  int i,k;
-  for(k = 0; k < number_of_paths; k++ )
-  {
-    char * temp_copy = (char *)malloc( strlen(paths[k]) + sizeof(char) );
-    temp_copy[ strlen(paths[k]) ] = '\0';
-    strncpy(temp_copy, paths[k], strlen(paths[k]));
-    for( i = 0; i < local_number; i++ )
-    {
-      if( compare(current_working_directory[i].DIR_Name, temp_copy) )
+      if( next_cluster == 0 )
       {
-        int j = 0;
-        ls_files = 0;
-        int32_t  next_cluster = current_working_directory[i].DIR_FirstClusterLow;
-        if( next_cluster == 0 )
-        {
-          next_cluster = 2;
-        }
-        if( !ls_flag )
-        {
-          free_directory();
-          current_working_directory = (struct DirectoryEntry *)malloc(sizeof(struct DirectoryEntry) * 16);
-          number_of_files = 0;
-        }
-        else
-        {
-          ls_directory = (struct DirectoryEntry *)malloc(sizeof(struct DirectoryEntry) * 16);
-        }
-        do
-        {
-          if( j != 0 )
-          {
-            if( !ls_flag )
-            {
-              current_working_directory = (struct DirectoryEntry * )realloc( current_working_directory , sizeof(struct DirectoryEntry) * number_of_files *16);
-            }
-            else
-            {
-              ls_directory = (struct DirectoryEntry * )realloc( ls_directory , sizeof(struct DirectoryEntry) * (ls_files) * 16);
-            }
-          }
-          int offset = LBAToOffset(next_cluster);
-          fseek(fat32_image,offset, SEEK_SET);
-          if( !ls_flag )
-          {
-            fread(&current_working_directory[j], sizeof(struct DirectoryEntry), 16, fat32_image);
-            number_of_files +=16;
-          }
-          else
-          {
-            fread(&ls_directory[j], sizeof(struct DirectoryEntry), 16, fat32_image);
-          }
-          next_cluster = NextLB(next_cluster);
-          j += 15;
-          ls_files += 16;
-        }
-        while( next_cluster != -1 );
-        local_number = number_of_files;
+        next_cluster = 2;
       }
+      int offset = LBAToOffset(next_cluster);
+      fseek(fat32_image, offset, SEEK_SET);
+      fread(&directory_to_return[j], sizeof(struct DirectoryEntry), 16, fat32_image);
+      next_cluster = NextLB(next_cluster);
+      total_number_of_files += 16;
+      j += 15;
     }
-    free(temp_copy);
+    while( next_cluster != -1 );
+    *new_size = total_number_of_files;
+    return directory_to_return;
   }
-  for( i = 0; i < number_of_paths; i++ )
+  else
   {
-    free(paths[i]);
+    return NULL;
   }
-  free(paths);
 }
-void handle_ls( char * path )
+
+void handle_ls(struct DirectoryEntry * directory,char * path )
 {
   if( !file_open )
   {
@@ -636,7 +589,9 @@ void handle_ls( char * path )
   }
   if( strcmp(path, "..") == 0 )
   {
-    handle_cd("..", true);
+    // Same idea for handle_cd_wrapper
+    // We keep track of the pointer head so that we can free it
+    ls_directory = handle_cd(current_working_directory, "..", number_of_files, &ls_files);
     int i;
     if( !ls_directory ) return;
     for( i = 0; i < ls_files; i++ )
@@ -651,6 +606,7 @@ void handle_ls( char * path )
         printf("%s\n", curr_working_str);
       }
     }
+    free_directory(&ls_directory);
   }
   else
   {
@@ -676,9 +632,88 @@ void handle_read( char * name , char * position, char * number_of_bytes )
     printf("Error: File system image must be opened first.\n");
     return;
   }
+  int index;
+  if( find_file(current_working_directory, name, &index, number_of_files ) )
+  {
+    int file_position = atoi(position);
+    int bytes = atoi(number_of_bytes);
+    int16_t cluster = current_working_directory[index].DIR_FirstClusterLow;
+    int offset = LBAToOffset(cluster);
+    char * buffer = (char*)malloc(bytes*sizeof(char));
+    fseek(fat32_image, offset+file_position, SEEK_SET);
+    fread(&buffer[0],bytes, 1, fat32_image);
+    int k;
+    for( k = 0; k < bytes; k++ )
+    {
+      printf("%#04X ", buffer[k]);
+    }
+    printf("\n");
+  }
+//  int index;
+//  if( find_file(current_working_directory, name, &index, number_of_files) )
+//  {
+//    int file_position = atoi(position);
+//    int bytes = atoi(number_of_bytes);
+//    char * buffer = (char*)malloc(bytes*sizeof(char));
+//    int16_t cluster;
+//    if( file_position >= 512 )
+//    {
+//      cluster = NextLB(current_working_directory[index].DIR_FirstClusterLow);
+//    }
+//    else
+//    {
+//      cluster = current_working_directory[index].DIR_FirstClusterLow;
+//
+//    }
+//    int offset = LBAToOffset(cluster);
+//    if( bytes <= BPB_BytsPerSec )
+//    {
+//      if( cluster != -1 )
+//      {
+//        fseek(fat32_image, offset + file_position, SEEK_SET);
+//        fread(&buffer[0], bytes,1,fat32_image);
+//        free(buffer);
+//      }
+//    }
+//    else
+//    {
+//      int l = 0;
+//      int bytes_to_read_in = 512;
+//      int count = 0;
+//      while( bytes >= 0 )
+//      {
+//        if( cluster != -1 )
+//        {
+//          offset = LBAToOffset(cluster);
+//          // We only want to apply file_position(a.k.a offset),to the beginning of the
+//          // file.
+//          if( count == 0 )
+//          {
+//            fseek(fat32_image, offset + file_position, SEEK_SET);
+//          }
+//          else
+//          {
+//            fseek(fat32_image, offset , SEEK_SET);
+//          }
+//          if( bytes < 512 ) bytes_to_read_in = bytes;
+//          fread(&buffer[l], bytes_to_read_in, 1, fat32_image);
+//          cluster = NextLB(cluster);
+//          l+= bytes_to_read_in-1;
+//          bytes -= BPB_BytsPerSec;
+//          count++;
+//        }
+//      }
+//    }
+//    int k;
+//    for( k = 0; k < bytes; k++ )
+//    {
+//      printf("%#04X ", buffer[k]);
+//    }
+//    printf("\n");
+//  }
 }
 
-int compare( char * string1 , char * string2 )
+int compare( char * string1 , char * string2, char ** return_string )
 {
   char * lhs = (char*)malloc(strlen(string1) + sizeof(char));
   char * rhs = (char*)malloc(strlen(string2) + sizeof(char));
@@ -727,7 +762,10 @@ int compare( char * string1 , char * string2 )
   {
     expanded_name[i] = toupper( expanded_name[i] );
   }
-  
+  if( return_string != NULL )
+  {
+    strcpy(*return_string, expanded_name);
+  }
   if( strncmp( expanded_name, lhs, 11 ) == 0 )
   {
     free(lhs);
@@ -762,9 +800,12 @@ int count_back_paths( char * path_name )
 
 char ** get_cd_paths( char * path_name, int * number )
 {
+  char * temp = (char*)malloc((strlen(path_name) + 1) * sizeof(char));
+  temp[strlen(path_name)] = '\0';
+  strncpy(temp, path_name, strlen(path_name));
   char ** paths = (char**)malloc(255 * sizeof(char*));
   int i = 0;
-  char * token = strtok(path_name, "/");
+  char * token = strtok(temp, "/");
   if( token )
   {
     size_t token_size = strlen(token);
@@ -785,22 +826,22 @@ char ** get_cd_paths( char * path_name, int * number )
   return paths;
 }
 
-int find_file( struct DirectoryEntry * directory, char * name, int * index )
+int find_file( struct DirectoryEntry * directory, char * name, int * index, int size )
 {
   int i;
-  char * temp = (char*)malloc(strlen(name)+ sizeof(char));
-  for( i = 0; i < number_of_files; i++ )
+  for( i = 0; i < size; i++ )
   {
+    char * temp = (char*)malloc((strlen(name) + 1) * sizeof(char));
     temp[strlen(name)] = '\0';
     strncpy(temp, name, strlen(name));
-    if( compare(directory[i].DIR_Name, temp) )
+    if( compare(directory[i].DIR_Name, temp, NULL) )
     {
       free(temp);
       *index = i;
       return true;
     }
+    free(temp);
   }
-  free(temp);
   *index = -1;
   return false;
 }
@@ -818,4 +859,33 @@ int find_unused_file( struct DirectoryEntry * directory )
   return -1;
 }
 
-
+void handle_cd_wrapper( struct DirectoryEntry * directory, char ** path )
+{
+  // We are going to be moving the pointer head so we need to be able to free the memory
+  // count_back_paths modifies the argument string so we need to keep track of that pointer as well
+  struct DirectoryEntry * directory_pointer;
+  char * string_pointer = *path;
+  int back_paths = count_back_paths(*path);
+  if( back_paths > 1 )
+  {
+    int j;
+    for( j = 0; j < back_paths; j++ )
+    {
+      directory_pointer = current_working_directory;
+      current_working_directory = handle_cd(current_working_directory, "..", number_of_files,&number_of_files);
+      free_directory(&directory_pointer);
+    }
+  }
+  else
+  {
+    int number_of_paths,k;
+    char ** paths = get_cd_paths(*path, &number_of_paths);
+    for( k = 0; k < number_of_paths; k++ )
+    {
+      directory_pointer = current_working_directory;
+      current_working_directory = handle_cd(current_working_directory, paths[k], number_of_files,&number_of_files);
+      free_directory(&directory_pointer);
+    }
+  }
+  *path = string_pointer;
+}
